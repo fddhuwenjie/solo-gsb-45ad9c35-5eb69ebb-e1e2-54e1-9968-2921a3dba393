@@ -506,6 +506,61 @@ def edge_between(adj, a, b):
     return None
 
 
+def _single_source_path(adj, start, goals):
+    """单源 BFS：start 到 goals 任一端口的最短无向路径。
+
+    邻居按端口名字典序展开，前驱选择因此完全确定（不依赖集合迭代序，
+    字符串 hash 随机化下跨进程复审也稳定）。返回端口列表或 None。
+    """
+    prev = {start: (None, None)}
+    q = deque([start])
+    hit = start if start in goals else None
+    while q and hit is None:
+        u = q.popleft()
+        for v, edge in sorted(adj.get(u, ()), key=lambda x: x[0]):
+            if v in prev:
+                continue
+            prev[v] = (u, edge)
+            if v in goals:
+                hit = v
+                break
+            q.append(v)
+    if hit is None:
+        return None
+    nodes = []
+    x = hit
+    while x is not None:
+        nodes.append(x)
+        x = prev[x][0]
+    nodes.reverse()
+    return nodes
+
+
+def stable_bridge_path(adj, group_ports):
+    """不同来源端口组之间的最短无向“接桥路径”（多源 BFS 的稳定版本）。
+
+    ``group_ports`` 为若干组端口（每组内部同源、不作为证据）；返回
+    ``(i, j, nodes)``：第 i 组任一端口到第 j 组任一端口跳数最少的路径，
+    长度并列时按整条端口序列字典序取最小（正反两个方向都参与比较，
+    结果不依赖组的排列顺序）。找不到返回 None。
+    """
+    best = None
+    for i in range(len(group_ports)):
+        for j in range(i + 1, len(group_ports)):
+            for gi, gj in ((i, j), (j, i)):
+                goals = set(group_ports[gj])
+                for start in group_ports[gi]:
+                    nodes = _single_source_path(adj, start, goals)
+                    if nodes is None:
+                        continue
+                    key = (len(nodes), tuple(nodes))
+                    if best is None or key < best[0]:
+                        best = (key, i, j, nodes)
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
 # ---- 证据序列化 -----------------------------------------------------------
 
 
@@ -789,7 +844,6 @@ def audit_signals(config, labels_raw):
     # 归并（有向衍生必在同一无向分量内；不同分量即便共用终源也不相关）。
     # group: {key, kind, origin, originPorts, members[(cid, ports)], routes}
     groups_by_comp = defaultdict(dict)
-    mix_members = []                         # (物理分量, 组, 源 SCC)
     for cid in source_sccs:
         members = scc_ports(cid)
         root = find(members[0]) if members else None
@@ -808,8 +862,6 @@ def audit_signals(config, labels_raw):
             g["originPorts"] = origin_list(key)
         g["members"].append((cid, members))
         g["routes"].extend(i for p in members for i in routes_from[p])
-        if g["kind"] == "mix":
-            mix_members.append((root, g, cid))
     for groups in groups_by_comp.values():
         for g in groups.values():
             g["members"].sort(key=lambda m: (m[1] or [""])[0])
@@ -843,70 +895,147 @@ def audit_signals(config, labels_raw):
 
     # 独立源（非混合）组按物理分量两两配对；混合点同时归属多个独立源时，
     # 作为下游混合点附注到对应串线条目（与旧逻辑的 downstream 语义一致）。
+    # 若一个混合组携带的终源集合**没有被任何独立源配对覆盖**（典型：规划里
+    # 只有混合输出自身的路由，如 MIX.out→MON.in；两个真实源都没有直接建
+    # 路由），则从混合组反向恢复其全部真实根源，单独报一条串线——这正是
+    # “只规划混合输出”场景，不能因混合组被排除在两两配对之外而漏报。
+    CROSSTALK_CLOSING = (
+        "改名或改别名不会改变信号源归属，无法消除本报警。"
+        "只能调整路由规划（取消或改道相关路由）或断开它们之间的物理连通"
+        "（拔除跳线 / 改变常态模式 / 修改背板接线）后重新规划。")
+
+    def add_crosstalk(uroot, sources, downstream_groups, evidence_nodes, body,
+                      note_groups=None):
+        """构造一条串线问题。sources/downstream 均为 group_payload 结构，
+        sources 各自的 routes 已完成“混合路由同时归属每个真实根源”的折叠。
+        body 为不含收尾句号的正文；note_groups 会在收尾句前附注
+        （混合输出自身已在正文描述时不重复附注，但仍列入 downstream 字段）。"""
+        names = sorted({p for s in sources for p in s["ports"]})
+        rts_all = sorted({i for s in sources for i in s["routes"]}
+                         | {i for g in downstream_groups for i in g["routes"]})
+        tail = ""
+        if note_groups is None:
+            note_groups = downstream_groups
+        if note_groups:
+            tail = ("；下游混合点 " + "、".join(
+                f"源端口 {g['ports'][0]}（路由 "
+                f"{'、'.join(str(i + 1) for i in g['routes'])}）"
+                for g in note_groups)
+                + " 的信号由上述独立源并流而成，这些路由同时归属这些独立源")
+        issues.append({
+            "type": CROSSTALK, "severity": "error",
+            "title": TYPE_TITLES[CROSSTALK],
+            "message": body + tail + "。" + CROSSTALK_CLOSING,
+            "resolution": "调整路由规划或断开独立源之间的物理连通后重新规划；"
+                          "重命名规范名 / 别名不能消除串线。",
+            "component": uroot,
+            # names 沿用数组结构供排序使用，内容为与标签无关的源端口
+            "names": names,
+            "sources": [{"port": s["port"], "ports": s["ports"],
+                         "originPorts": s["originPorts"],
+                         "routes": s["routes"]} for s in sources],
+            "routes": rts_all,
+            "routesBySource": {s["port"]: s["routes"] for s in sources},
+            "downstream": [{"port": g["port"], "ports": g["ports"],
+                            "originPorts": g["originPorts"],
+                            "routes": g["routes"]} for g in downstream_groups],
+            "evidence": evidence_items(evidence_nodes, adj, plan,
+                                       _node_label_map(decls)),
+            "fixes": [],
+        })
+
     for uroot, gmap in groups_by_comp.items():
         independents = sorted((g for g in gmap.values() if g["kind"] != "mix"),
                               key=lambda g: group_payload(g)["port"])
+        mix_groups = sorted((g for g in gmap.values() if g["kind"] == "mix"),
+                            key=lambda g: group_payload(g)["port"])
+        covered_mix = set()                    # 已被独立源配对覆盖的混合组键
+
+        def pair_downstream(oid_a, oid_b):
+            """终源集合同时包含这两个独立源的下游混合组（携带路由）。"""
+            out = []
+            for g in mix_groups:
+                ids = g["key"][1]
+                if oid_a in ids and oid_b in ids and g["routes"]:
+                    out.append(g)
+            out.sort(key=lambda x: group_payload(x)["port"])
+            return out
+
         for ai in range(len(independents)):
             for bi in range(ai + 1, len(independents)):
                 ga, gb = independents[ai], independents[bi]
                 pa, pb = group_payload(ga), group_payload(gb)
                 # 证据：两组分支的实际路由源端口之间的最短无向物理路径
-                nodes, _ = shortest_path(adj, pa["ports"], pb["ports"])
-                if nodes is None:
+                bridge = stable_bridge_path(adj, [pa["ports"], pb["ports"]])
+                if bridge is None:
                     continue
-                # 下游混合点：混合组的终源集合同时包含这两个独立源
-                a_ids, b_ids = ga["key"][1], gb["key"][1]
-                a_origin = next(iter(a_ids))
-                b_origin = next(iter(b_ids))
-                downstream = []
-                for root, g, cid in mix_members:
-                    if root != uroot:
-                        continue
-                    ids = g["key"][1]
-                    if a_origin in ids and b_origin in ids and g["routes"]:
-                        downstream.append(group_payload(g))
-                downstream.sort(key=lambda x: x["port"])
-                rts_all = sorted(set(pa["routes"] + pb["routes"]
-                                     + [i for g in downstream for i in g["routes"]]))
-                tail = ""
-                if downstream:
-                    tail = ("；下游混合点 " + "、".join(
-                        f"源端口 {g['ports'][0]}（路由 "
-                        f"{'、'.join(str(i + 1) for i in g['routes'])}）"
-                        for g in downstream)
-                        + " 的信号由上述独立源并流而成，这些路由同时归属两个独立源")
-                issues.append({
-                    "type": CROSSTALK, "severity": "error",
-                    "title": TYPE_TITLES[CROSSTALK],
-                    "message": f"独立信号源「{desc_group(ga)}」与「{desc_group(gb)}」"
-                               f"的已规划路由在同一物理连通分量汇合，两个反向追溯到"
-                               f"不同终源、互不衍生的独立信号在该分量内等电位（覆盖"
-                               f"设备内部混合与半常态并送汇合），发生跨路由串线。"
-                               f"改名或改别名不会改变信号源归属，无法消除本报警{tail}。"
-                               f"只能调整路由规划（取消或改道相关路由）或断开它们"
-                               f"之间的物理连通（拔除跳线 / 改变常态模式 / 修改背板"
-                               f"接线）后重新规划。",
-                    "resolution": "调整路由规划或断开独立源之间的物理连通后重新规划；"
-                                  "重命名规范名 / 别名不能消除串线。",
-                    "component": uroot,
-                    # names 沿用数组结构供排序使用，内容为与标签无关的源端口
-                    "names": sorted(pa["ports"] + pb["ports"]),
-                    "sources": [{"port": pa["port"], "ports": pa["ports"],
-                                 "originPorts": pa["originPorts"],
-                                 "routes": pa["routes"]},
-                                {"port": pb["port"], "ports": pb["ports"],
-                                 "originPorts": pb["originPorts"],
-                                 "routes": pb["routes"]}],
-                    "routes": rts_all,
-                    "routesBySource": {pa["port"]: pa["routes"],
-                                       pb["port"]: pb["routes"]},
-                    "downstream": [{"port": g["port"], "ports": g["ports"],
-                                    "originPorts": g["originPorts"],
-                                    "routes": g["routes"]} for g in downstream],
-                    "evidence": evidence_items(nodes, adj, plan,
-                                               _node_label_map(decls)),
-                    "fixes": [],
-                })
+                nodes = bridge[2]
+                a_origin = next(iter(ga["key"][1]))
+                b_origin = next(iter(gb["key"][1]))
+                downstream = pair_downstream(a_origin, b_origin)
+                for g in downstream:
+                    covered_mix.add(g["key"])
+                message = (
+                    f"独立信号源「{desc_group(ga)}」与「{desc_group(gb)}」"
+                    f"的已规划路由在同一物理连通分量汇合，两个反向追溯到"
+                    f"不同终源、互不衍生的独立信号在该分量内等电位（覆盖"
+                    f"设备内部混合与半常态并送汇合），发生跨路由串线。")
+                add_crosstalk(uroot, [pa, pb],
+                              [group_payload(g) for g in downstream],
+                              nodes, message)
+
+        # 未被任何独立源配对覆盖的混合组：从其反向终源恢复真实根源，
+        # 混合组自身的每条路由同时归属全部恢复根源，单报一条串线。
+        for gm in mix_groups:
+            if gm["key"] in covered_mix or not gm["routes"]:
+                continue
+            oids = sorted(gm["key"][1], key=lambda o: origin_ports(o))
+            sources = []
+            for oid in oids:
+                # 分量内可能恰有该终源的直接同源分支组（携带它自己的路由），
+                # 这些路由与混合组路由一样属于该恢复根源。
+                direct = gmap.get(("origin", frozenset((oid,))))
+                origin_pts = origin_ports(oid)
+                if direct is not None:
+                    dp = group_payload(direct)
+                    ports, rep = dp["ports"], dp["port"]
+                    routes = set(direct["routes"])
+                else:
+                    ports, rep = origin_pts, (origin_pts[0] if origin_pts else "")
+                    routes = set()
+                routes |= set(gm["routes"])
+                sources.append({"port": rep, "ports": ports,
+                                "originPorts": origin_pts,
+                                "routes": sorted(routes), "mixed": False})
+            # 该混合组自身（混合输出端口）即下游混合点，列入 downstream；
+            # 同分量内、终源集合包含全部恢复根源的其他混合组一并附注。
+            downstream_raw = [gm] + [
+                g for g in mix_groups
+                if g is not gm and g["routes"] and set(g["key"][1]) >= set(oids)]
+            downstream_raw.sort(key=lambda x: group_payload(x)["port"])
+            downstream = [group_payload(g) for g in downstream_raw]
+            # 正文附注只提“其他”混合组：混合输出自身已在正文描述
+            note_groups = [group_payload(g) for g in downstream_raw if g is not gm]
+            bridge = stable_bridge_path(adj, [s["ports"] for s in sources])
+            if bridge is None:
+                continue
+            nodes = bridge[2]
+            src_text = "；".join(
+                f"真实根源 {('、'.join(s['originPorts']))}"
+                + (f"（含源端口 {('、'.join(s['ports']))} 的分支）"
+                   if s["ports"] != s["originPorts"] else "")
+                for s in sources)
+            mix_pts = "、".join(group_payload(gm)["ports"])
+            rts = "、".join(str(i + 1) for i in gm["routes"])
+            message = (
+                f"仅规划了下游混合输出的路由：源端口 {mix_pts} 的路由 {rts} "
+                f"是 {len(sources)} 路并流形成的混合点（如调音台混合输出），"
+                f"从该路由源沿设备内部、生效常态与跳线反向恢复出 "
+                f"{len(sources)} 个互不衍生的真实根源——{src_text}；该混合路由"
+                f"同时归属这些独立源，它们在同一物理连通分量等电位，发生跨"
+                f"路由串线")
+            add_crosstalk(uroot, sources, downstream, nodes, message,
+                          note_groups=note_groups or None)
 
     # ---- 排序与编号 ------------------------------------------------------
     order = {MUTEX: 0, CROSSTALK: 1, ALIAS_RING: 2, UNLABELED: 3}
