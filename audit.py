@@ -27,6 +27,10 @@
 多输出设备的两个输出、或被同一信号推动的常态/跳线分支）若都从同一个
 上游终源 SCC 衍生，则它们只是该独立源的同源分支，归为同一来源，不计串线；
 只有反向终源互不相同（真正的多源混合、半常态并送汇合）时才报串线。
+即便路由列表里**只有混合输出**（如仅 MIX.out→MON.in 一条、两个真实源分别
+经生效常态进入 MIX.in1/in2），审计也会从该混合源的终源集合反向恢复出真实
+独立源，把混合输出路由同时归属各源并照常报一条串线，不会因混合点自身被归
+为 mix 而漏报。
 串线**不提供可消警的改名操作**，只有调整路由规划或物理连通才能消除。
 """
 
@@ -470,13 +474,16 @@ def shortest_path(adj, starts, goals):
     """多源 BFS：starts 中任一端点到 goals 中任一端点的最短无向路径。
 
     返回端口列表（长度 ≥1）。相邻端口之间的边由调用方经 BFS 前驱重建。
+    起点 / 终点均按端口名排序入队，邻接按图插入序（设备、常态、跳线，均为
+    配置稳定顺序）展开，因此同跳数的最短路径命中选择也是可复现的。
     """
     starts, goals = set(starts), set(goals)
     common = starts & goals
     if common:
-        return [next(iter(common))], {}
-    prev = {s: (None, None) for s in starts}
-    q = deque(starts)
+        return [min(common)], {}
+    start_list = sorted(starts)
+    prev = {s: (None, None) for s in start_list}
+    q = deque(start_list)
     hit = None
     while q and hit is None:
         u = q.popleft()
@@ -741,6 +748,12 @@ def audit_signals(config, labels_raw):
     #    其路由归属全部终源（下游混合点）；
     #  - 同一无向物理分量内出现两个不同终源 → 跨路由串线。改名/改别名不会
     #    改变归属，只有调整路由规划或物理连通才能消除，因此不提供 rename。
+    #  - “只规划混合输出”时（如仅 MIX.out→MON.in 一条路由，两个真实源各自
+    #    经生效常态进入 MIX.in1/in2），路由源 SCC 只命中 mix 一类，配对阶段
+    #    会漏掉它。审计此时必须从混合点的终源集合**反向恢复**真实独立源：
+    #    为每个终源补一个独立源组，把混合输出路由同时归属这些恢复出的源，
+    #    再按“同一分量内不同终源两两配对”照常产出一条串线（证据端点取终源
+    #    输出端口，因为真实源处并没有直接路由源端口可用）。
     dsucc = build_signal_digraph(plan)
     planned_routes = [(info["index"], info["source"])
                       for info in plan["planned"] if info["ok"]]
@@ -815,17 +828,51 @@ def audit_signals(config, labels_raw):
             g["members"].sort(key=lambda m: (m[1] or [""])[0])
             g["routes"] = sorted(set(g["routes"]))
 
+    # 从每个物理分量内的混合组（mix）**反向恢复真实独立源**：混合点自身没有
+    # 路由源 SCC 以外的独立组时（典型：只规划了混合输出 MIX.out→MON.in，
+    # 没有任何一条路由直接从两个真实源出发），若不补源，配对阶段只会看到
+    # 单个 mix 组而漏报串线。因此对 mix 来源键中的每个终源 SCC：
+    #   - 该终源在本分量已有独立源组 → 把混合点的路由补归属到该组（混合
+    #     输出同时携带该独立源的信号）；
+    #   - 否则合成一个“恢复独立源”虚拟组（无实际路由源 SCC，members 为空，
+    #     代表端口取终源输出端口），让混合点的每两个不同终源仍能配成一对
+    #     串线；这些路由在 payload 中同时归属恢复出的两源。
+    for uroot, gmap in groups_by_comp.items():
+        recovered = {}              # 终源 SCC → 恢复/既有的独立源组
+        for g in gmap.values():
+            if g["kind"] == "origin" and g["origin"] is not None:
+                recovered[g["origin"]] = g
+        # 混合组按代表端口稳定遍历，保证补归属与虚拟组顺序可复现
+        for g in sorted((x for x in gmap.values() if x["kind"] == "mix"),
+                        key=lambda x: x["originPorts"]):
+            for ocid in sorted(g["key"][1], key=lambda c: origin_ports(c)):
+                og = recovered.get(ocid)
+                if og is None:
+                    vkey = ("origin", frozenset((ocid,)))
+                    og = gmap.get(vkey)
+                    if og is None:
+                        og = {"key": vkey, "kind": "origin", "origin": ocid,
+                              "originPorts": origin_ports(ocid),
+                              "members": [], "routes": [],
+                              "recoveredFromMix": True}
+                        gmap[vkey] = og
+                    recovered[ocid] = og
+                og["routes"] = sorted(set(og["routes"]) | set(g["routes"]))
+
     def group_payload(g):
         # 代表端口：独立源取反向追溯到的终源输出（稳定的来源归属），
         # 混合点 / 无驱动总线取其实际路由源端口（混合就发生在那里）。
+        # 从混合点恢复出的虚拟独立源没有路由源端口（members 为空），
+        # 其代表与证据端点直接取反向追溯到的终源输出端口。
         member_ports = sorted({p for _, mp in g["members"] for p in mp})
         if g["kind"] == "origin":
-            rep = g["originPorts"][0] if g["originPorts"] else (
-                member_ports[0] if member_ports else "")
+            rep = (g["originPorts"][0] if g["originPorts"] else "")
+            ports = member_ports or list(g["originPorts"])
         else:
             rep = member_ports[0] if member_ports else (
                 g["originPorts"][0] if g["originPorts"] else "")
-        return {"port": rep, "ports": member_ports,
+            ports = member_ports
+        return {"port": rep, "ports": ports,
                 "originPorts": g["originPorts"],
                 "routes": g["routes"],
                 "mixed": g["kind"] == "mix"}
@@ -835,7 +882,11 @@ def audit_signals(config, labels_raw):
         rts = "、".join(str(i + 1) for i in gp["routes"])
         ports = "、".join(gp["ports"])
         head = f"源端口 {ports} 的路由 {rts}" if rts else f"源端口 {ports}"
-        if g["kind"] == "origin" and g["originPorts"] \
+        if g.get("recoveredFromMix"):
+            # 只规划了混合输出时，真实源没有任何直接路由：这里的归属关系是
+            # 从混合点沿信号方向反向恢复出来的。
+            head = f"{head}（真实源无直接路由，由下游混合输出反向恢复归属）"
+        elif g["kind"] == "origin" and g["originPorts"] \
                 and g["originPorts"] != gp["ports"]:
             up = "、".join(g["originPorts"])
             head = f"{head}（反向追溯到共同上游 {up}，为同源分支）"
@@ -850,7 +901,9 @@ def audit_signals(config, labels_raw):
             for bi in range(ai + 1, len(independents)):
                 ga, gb = independents[ai], independents[bi]
                 pa, pb = group_payload(ga), group_payload(gb)
-                # 证据：两组分支的实际路由源端口之间的最短无向物理路径
+                # 证据：两组来源代表端口之间的最短无向物理路径
+                # （常规独立源组为实际路由源端口；由混合点反向恢复出的组取
+                # 终源输出端口——其真实源处并没有直接路由源端口）
                 nodes, _ = shortest_path(adj, pa["ports"], pb["ports"])
                 if nodes is None:
                     continue
